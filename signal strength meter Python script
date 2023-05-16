@@ -1,0 +1,88 @@
+import time
+import subprocess
+import argparse
+import logging
+import os
+from datetime import datetime
+import smtplib
+from email.mime.text import MIMEText
+
+# Set up GPIO for the LCD display
+import RPi.GPIO as GPIO
+from RPLCD.gpio import CharLCD
+
+
+def read_signal_strength(device, baud_rate):
+    """Reads the signal strength value from the specified modem device."""
+    cmd = 'AT+CSQ'
+    result = subprocess.check_output(['echo', cmd, '|', 'sudo', 'cu', '-l', device, '-s', str(baud_rate), '-E', '-vvv'], shell=True)
+    csq = result.decode().split(':')[1].split(',')[0].strip()
+    dbm = int(csq) * 2 - 113
+    return dbm
+
+
+def display_info(lcd, provider, network_type, ip_address, signal_strength):
+    """Displays the network information and signal strength on the specified LCD."""
+    lcd.clear()
+    lcd.write_string('Provider: {}\n'.format(provider))
+    lcd.write_string('Network: {}\n'.format(network_type))
+    lcd.write_string('IP: {}\n'.format(ip_address))
+    lcd.write_string('Signal: {} dBm\n'.format(signal_strength))
+
+
+def log_data(log_file, log_level, timestamp, provider, network_type, ip_address, signal_strength):
+    """Logs the network information and signal strength to the specified log file."""
+    logging.basicConfig(filename=log_file, level=log_level)
+    logging.info('{} - Provider: {}, Network: {}, IP: {}, Signal: {} dBm'.format(timestamp, provider, network_type, ip_address, signal_strength))
+
+
+def send_alert(email_address, email_password, recipient, subject, message):
+    """Sends an email alert to the specified recipient."""
+    server = smtplib.SMTP('smtp.gmail.com', 587)
+    server.starttls()
+    server.login(email_address, email_password)
+    msg = MIMEText(message)
+    msg['From'] = email_address
+    msg['To'] = recipient
+    msg['Subject'] = subject
+    server.sendmail(email_address, recipient, msg.as_string())
+    server.quit()
+
+
+if __name__ == '__main__':
+    # Set up command-line arguments
+    parser = argparse.ArgumentParser(description='4G Signal Strength Meter')
+    parser.add_argument('device', help='the device name for the 4G modem (e.g. /dev/ttyUSB0)')
+    parser.add_argument('baud_rate', type=int, help='the baud rate for the 4G modem (e.g. 115200)')
+    parser.add_argument('--log', dest='log_file', default='signal_strength.log', help='the name of the log file')
+    parser.add_argument('--log-level', dest='log_level', default='INFO', help='the log level (e.g. INFO, DEBUG, etc.)')
+    parser.add_argument('--email', dest='email_address', help='the email address to use for alerts')
+    parser.add_argument('--password', dest='email_password', help='the password to use for email alerts')
+    parser.add_argument('--recipient', dest='recipient', help='the email address to send alerts to')
+    parser.add_argument('--threshold', dest='threshold', type=int, default=-100, help='the signal strength threshold for alerts')
+    args = parser.parse_args()
+
+    # Configure GPIO for the LCD display
+    lcd = CharLCD(pin_rs=26, pin_e=19, pins_data=[13, 6, 5, 11], numbering_mode=GPIO.BCM)
+
+    while True:
+        # Read the network information and signal strength
+        provider = subprocess.check_output(['sudo', 'qmicli', '-d', args.device, '--nas-get-serving-system']).decode().split('\n')[1].split(',')[2].strip()
+        network_type = subprocess.check_output(['sudo', 'qmicli', '-d', args.device, '--nas-get-serving-system']).decode().split('\n')[1].split(',')[3].strip()
+        ip_address = subprocess.check_output(['sudo', 'qmicli', '-d', args.device, '--wds-get-packet-service-status']).decode().split('\n')[1].split(',')[7].strip()
+        signal_strength = read_signal_strength(args.device, args.baud_rate)
+
+        # Display the network information and signal strength
+        display_info(lcd, provider, network_type, ip_address, signal_strength)
+
+        # Log the network information and signal strength
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        log_data(args.log_file, args.log_level, timestamp, provider, network_type, ip_address, signal_strength)
+
+        # Send an email alert if the signal strength is below the threshold
+        if args.email_address and args.email_password and args.recipient and signal_strength < args.threshold:
+            message = 'Signal strength is below threshold: {} dBm'.format(signal_strength)
+            send_alert(args.email_address, args.email_password, args.recipient, '4G Signal Strength Alert', message)
+
+        # Wait for 1 second before measuring again
+        time.sleep(1)
