@@ -1,0 +1,144 @@
+import time
+import subprocess
+import argparse
+import csv
+import logging
+import os
+from datetime import datetime
+import smtplib
+from email.mime.text import MIMEText
+import sqlite3
+
+# Set up GPIO for the LCD display
+import RPi.GPIO as GPIO
+from RPLCD.gpio import CharLCD
+
+
+def read_data_usage(device):
+    """Reads the data usage information from the specified modem device."""
+    cmd = 'AT+CGACT=1,1'
+    subprocess.check_output(['sudo', 'qmicli', '-d', device, '--wds-start-network'])
+    subprocess.check_output(['sudo', 'qmicli', '-d', device, '--nas-get-signal-strength'])
+    result = subprocess.check_output(['sudo', 'qmicli', '-d', device, '--wds-get-packet-service-statistics']).decode()
+    rx_bytes = int(result.split('RX bytes: ')[1].split('\n')[0])
+    tx_bytes = int(result.split('TX bytes: ')[1].split('\n')[0])
+    return (rx_bytes, tx_bytes)
+
+
+def display_usage(lcd, provider, network_type, ip_address, rx_bytes, tx_bytes):
+    """Displays the data usage information on the specified LCD."""
+    lcd.clear()
+    lcd.write_string('Provider: {}\n'.format(provider))
+    lcd.write_string('Network Type: {}\n'.format(network_type))
+    lcd.write_string('IP Address: {}\n'.format(ip_address))
+    lcd.write_string('RX: {} bytes\n'.format(rx_bytes))
+    lcd.write_string('TX: {} bytes\n'.format(tx_bytes))
+
+
+def write_usage_to_csv(file_name, provider, network_type, ip_address, rx_bytes, tx_bytes):
+    """Writes the data usage information to the specified CSV file."""
+    csv_file_exists = os.path.isfile(file_name)
+    with open(file_name, 'a') as csv_file:
+        fieldnames = ['timestamp', 'provider', 'network_type', 'ip_address', 'rx_bytes', 'tx_bytes']
+        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+        if not csv_file_exists:
+            writer.writeheader()
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        writer.writerow({'timestamp': timestamp, 'provider': provider, 'network_type': network_type, 'ip_address': ip_address, 'rx_bytes': rx_bytes, 'tx_bytes': tx_bytes})
+
+
+def send_alert(email_address, email_password, recipient, subject, message):
+    """Sends an email alert to the specified recipient."""
+    server = smtplib.SMTP('smtp.gmail.com', 587)
+    server.starttls()
+    server.login(email_address, email_password)
+    msg = MIMEText(message)
+    msg['From'] = email_address
+    msg['To'] = recipient
+    msg['Subject'] = subject
+    server.sendmail(email_address, recipient, msg.as_string())
+    server.quit()
+
+
+def send_sms_alert(phone_number, message):
+    """Sends an SMS alert to the specified phone number using Twilio."""
+    from twilio.rest import Client
+    account_sid = 'YOUR_ACCOUNT_SID'
+    auth_token = 'YOUR_AUTH_TOKEN'
+    client = Client(account_sid, auth_token)
+    message = client.messages.create(
+        body=message,
+        from_='YOUR_TWILIO_PHONE_NUMBER',
+        to=phone_number
+    )
+
+
+def reset_data_usage(conn):
+    """Resets the data usage counter in the database."""
+    cursor = conn.cursor()
+    cursor.execute('UPDATE data_usage SET rx_bytes = 0, tx_bytes = 0')
+
+
+if __name__ == '__main__':
+    # Set up command-line arguments
+    parser = argparse.ArgumentParser(description='4G LTE Data Usage Tracker')
+    parser.add_argument('device', help='the device name for the 4G modem (e.g. /dev/ttyUSB0)')
+    parser.add_argument('--csv', dest='csv_file', default='data_usage.csv', help='the name of the CSV file to write data usage to')
+    parser.add_argument('--email', dest='email_address', help='the email address to use for alerts')
+    parser.add_argument('--password', dest='email_password', help='the password to use for email alerts')
+    parser.add_argument('--recipient', dest='recipient', help='the email address to send alerts to')
+    parser.add_argument('--sms', dest='phone_number', help='the phone number to send SMS alerts to')
+    parser.add_argument('--threshold', dest='threshold', type=int, default=1000000000, help='the data usage threshold for alerts')
+    parser.add_argument('--lcd', dest='lcd_enabled', action='store_true', help='enable output to an LCD display')
+    parser.add_argument('--db', dest='database_file', default='data_usage.db', help='the name of the SQLite database file')
+    parser.add_argument('--reset', dest='reset_interval', type=int, default=0, help='the number of seconds between automatic data usage resets')
+    args = parser.parse_args()
+
+    # Set up logging
+    logging.basicConfig(filename='data_usage.log', level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
+
+    # Set up GPIO for the LCD display
+    lcd = None
+    if args.lcd_enabled:
+        lcd = CharLCD(pin_rs=26, pin_e=19, pins_data=[13, 6, 5, 11], numbering_mode=GPIO.BCM)
+
+    # Set up SQLite database
+    conn = sqlite3.connect(args.database_file)
+    cursor = conn.cursor()
+    cursor.execute('''CREATE TABLE IF NOT EXISTS data_usage
+                      (timestamp TEXT, provider TEXT, network_type TEXT, ip_address TEXT, rx_bytes INT, tx_bytes INT)''')
+
+    while True:
+        # Read the data usage information
+        provider = subprocess.check_output(['sudo', 'qmicli', '-d', args.device, '--nas-get-home-network']).decode().split('\n')[1].split(',')[1]
+        network_type = subprocess.check_output(['sudo', 'qmicli', '-d', args.device, '--nas-get-signal-strength']).decode().split('\n')[1].split(',')[1]
+        ip_address = subprocess.check_output(['sudo', 'qmicli', '-d', args.device, '--wds-get-current-settings']).decode().split('\n')[4].split(',')[1]
+        rx_bytes, tx_bytes = read_data_usage(args.device)
+
+        # Display the data usage information
+        display_usage(lcd, provider, network_type, ip_address, rx_bytes, tx_bytes)
+
+        # Write the data usage information to a CSV file and database
+        write_usage_to_csv(args.csv_file, provider, network_type, ip_address, rx_bytes, tx_bytes)
+        cursor.execute('INSERT INTO data_usage VALUES (?, ?, ?, ?, ?, ?)', (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), provider, network_type, ip_address, rx_bytes, tx_bytes))
+        conn.commit()
+
+        # Send an email or SMS alert if the data usage is above the threshold
+        total_bytes = rx_bytes + tx_bytes
+        if total_bytes > args.threshold:
+            message = 'Data usage is above threshold: {} bytes'.format(total_bytes)
+            if args.email_address and args.email_password and args.recipient:
+                send_alert(args.email_address, args.email_password, args.recipient, '4G LTE Data Usage Alert', message)
+            if args.phone_number:
+                send_sms_alert(args.phone_number, message)
+
+        # Reset the data usage counter if necessary
+        if args.reset_interval > 0 and int(time.time()) % args.reset_interval == 0:
+            reset_data_usage(conn)
+
+        # Wait for 1 minute before measuring again
+        time.sleep(60)
+
+    # Clean up
+    conn.close()
+    GPIO.cleanup()
